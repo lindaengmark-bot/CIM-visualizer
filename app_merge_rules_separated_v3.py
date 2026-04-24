@@ -1,0 +1,845 @@
+"""
+app.py
+
+Streamlit frontend for the LLM Visualizer.
+Upload a Basic or Advanced export, explore charts, and export an enhanced Excel file.
+
+Run locally:
+  streamlit run app.py
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+import backend
+import importlib
+
+
+def _brand_merge_mapping_from_editor(df: pd.DataFrame) -> dict:
+    """Convert edited suggestions table to alias->canonical mapping."""
+    if df is None or getattr(df, "empty", True) or "combine" not in df.columns:
+        return {}
+    chosen = df[df["combine"] == True]
+    mapping = {}
+    for _, r in chosen.iterrows():
+        alias = str(r.get("alias", "")).strip()
+        canonical = str(r.get("canonical", "")).strip()
+        if alias and canonical and alias != canonical:
+            mapping[alias] = canonical
+    return mapping
+
+
+try:
+    import plotly.express as px
+except Exception:
+    px = None
+
+
+st.set_page_config(page_title="LLM Visualizer", layout="wide")
+
+
+@st.cache_data(show_spinner=False)
+def _sheet_names(file_bytes: bytes) -> List[str]:
+    return backend.list_sheet_names(file_bytes)
+
+
+@st.cache_data(show_spinner=True)
+def _read_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    return backend.read_sheet(file_bytes, sheet_name)
+
+
+@st.cache_data(show_spinner=False)
+def _read_sheets(file_bytes: bytes, sheet_names: List[str]) -> Dict[str, pd.DataFrame]:
+    return backend.read_sheets(file_bytes, sheet_names)
+
+
+
+def _pivot_to_long(df_pivot: pd.DataFrame, value_name: str) -> pd.DataFrame:
+    """
+    Convert a pivot table (index=group(s), columns=item) to long form with a readable group label.
+    """
+    if df_pivot is None or df_pivot.empty:
+        return pd.DataFrame(columns=["group", "item", value_name])
+
+    idx_cols = [c for c in (df_pivot.index.names or []) if c is not None]
+    long_df = df_pivot.reset_index().melt(id_vars=idx_cols, var_name="item", value_name=value_name)
+    long_df = long_df[long_df[value_name].notna()]
+
+    if idx_cols:
+        long_df["group"] = long_df[idx_cols].astype(str).agg(" | ".join, axis=1)
+    else:
+        long_df["group"] = "All"
+
+    return long_df
+
+
+def _plot_clustered_bars(df_pivot: pd.DataFrame, value_name: str, title: str, as_percent: bool = False):
+    """
+    Clustered (grouped) columns:
+    - x axis: item (brand or domain)
+    - color: group (platform, model, etc.)
+    - y axis: value (count or share)
+    Also renders a copy-friendly table directly under the chart.
+    """
+    st.subheader(title)
+
+    if df_pivot is None or df_pivot.empty:
+        st.info("No data to plot.")
+        return
+
+    long_df = _pivot_to_long(df_pivot, value_name=value_name)
+
+    # Optionally convert shares to %
+    plot_df = long_df.copy()
+    if as_percent:
+        plot_df[value_name] = plot_df[value_name] * 100.0
+
+    if px is None:
+        st.dataframe(df_pivot.reset_index(), use_container_width=True)
+        st.caption("Install plotly to enable interactive charts.")
+        return
+
+    fig = px.bar(
+        plot_df,
+        x="item",
+        y=value_name,
+        color="group",
+        barmode="group",
+        title=title,
+    )
+
+    y_title = "Percent" if as_percent else value_name.capitalize()
+    fig.update_layout(xaxis_title="Item", yaxis_title=y_title, legend_title="Group")
+
+    if as_percent:
+        fig.update_traces(hovertemplate="%{y:.1f}%<extra></extra>")
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Copy-friendly table under the chart
+    st.caption("Copy-friendly table")
+    if as_percent:
+        tbl = df_pivot.copy() * 100.0
+        st.dataframe(tbl.reset_index().round(2), use_container_width=True)
+    else:
+        st.dataframe(df_pivot.reset_index(), use_container_width=True)
+
+
+def _maybe_date_filter(df: pd.DataFrame, date_col: str = "run_date", key_prefix: str = "date") -> pd.DataFrame:
+    if date_col not in df.columns:
+        return df
+    d = df.copy()
+    if d[date_col].isna().all():
+        return d
+    d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+    min_d = d[date_col].min()
+    max_d = d[date_col].max()
+    if pd.isna(min_d) or pd.isna(max_d):
+        return d
+    with st.sidebar.expander("Date filter", expanded=False):
+        start, end = st.date_input(
+            "Run date range",
+            value=(min_d.date(), max_d.date()),
+            min_value=min_d.date(),
+            max_value=max_d.date(),
+            key=f"{key_prefix}_{date_col}",
+        )
+    start_ts = pd.to_datetime(start)
+    end_ts = pd.to_datetime(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    return d[(d[date_col] >= start_ts) & (d[date_col] <= end_ts)]
+
+
+def main():
+    st.title("LLM Visualizer")
+    st.caption("Upload a Basic or Advanced LLM tracking export, explore charts, and export an enhanced Excel file.")
+
+    uploaded = st.file_uploader("Upload an Excel export (.xlsx)", type=["xlsx"])
+    if not uploaded:
+        st.stop()
+
+    file_bytes = uploaded.getvalue()
+    sheet_names = _sheet_names(file_bytes)
+    info = backend.detect_export_type(sheet_names)
+
+    colA, colB = st.columns([2, 3])
+    with colA:
+        st.write("**Detected export type:**", info.export_type)
+    with colB:
+        st.write("**Sheets found:**", ", ".join(sheet_names))
+
+    # Load only relevant sheets by default
+    if info.export_type == "advanced":
+        default_sheets = [s for s in ["Results", "Mentions", "Citations", "SearchQueries"] if s in sheet_names]
+    else:
+        default_sheets = [s for s in ["brand_mentions", "answers"] if s in sheet_names]
+    with st.sidebar:
+        st.header("Data selection")
+        selected_sheets = st.multiselect(
+            "Sheets to load",
+            sheet_names,
+            default=default_sheets or sheet_names[:1],
+            key="sheets_select",
+        )
+
+    if not selected_sheets:
+        st.stop()
+
+    # Loading sheets is cached and usually fast, heavy calculations are gated behind a Run button.
+    raw_sheets = _read_sheets(file_bytes, selected_sheets)
+
+    # Decide mentions source and citations source
+    if info.export_type == "advanced":
+        mentions_sheet = "Mentions" if "Mentions" in raw_sheets else ("Results" if "Results" in raw_sheets else selected_sheets[0])
+        citations_sheet = "Citations" if "Citations" in raw_sheets else None
+    else:
+        # basic: prefer brand_mentions for mentions, answers for sentiment context if needed
+        mentions_sheet = "brand_mentions" if "brand_mentions" in raw_sheets else selected_sheets[0]
+        citations_sheet = None
+
+    df_mentions_src = raw_sheets.get(mentions_sheet)
+    df_citations_src = raw_sheets.get(citations_sheet) if citations_sheet else None
+
+    # Sidebar options and explicit Run button.
+    with st.sidebar:
+        st.header("Options")
+
+        # Brand column selection (depends on loaded mentions sheet)
+        brand_col_options = [c for c in df_mentions_src.columns if c.lower() in {"brands", "brand"}] + [
+            c for c in df_mentions_src.columns if "brand" in c.lower()
+        ]
+        brand_col = st.selectbox(
+            "Brand column",
+            options=brand_col_options or list(df_mentions_src.columns),
+            index=0,
+            key="brand_col_select",
+        )
+
+        inferred_brand_col = None
+        if "inferred_brands" in df_mentions_src.columns:
+            use_inferred = st.checkbox("Include inferred_brands (advanced Results)", value=False, key="use_inferred")
+            inferred_brand_col = "inferred_brands" if use_inferred else None
+
+        group_candidates = [c for c in ["platform", "model", "country", "run_date"] if c in df_mentions_src.columns]
+        group_cols = st.multiselect(
+            "Group by",
+            options=group_candidates,
+            default=[c for c in ["platform"] if c in group_candidates],
+            key="mentions_groupby",
+        )
+
+        top_n = st.slider("Top N items", 5, 50, int(st.session_state.get("top_n", 25)), 1, key="top_n_slider")
+        include_other = st.checkbox("Include 'Other' bucket", value=bool(st.session_state.get("include_other", True)), key="include_other_chk")
+        mapping_lines = ""
+
+        # Placeholder so Brand merge suggestions appears directly under Options
+        merge_box = st.container()
+
+
+        st.divider()
+
+    # Persist options
+    st.session_state["top_n"] = top_n
+    st.session_state["include_other"] = include_other
+
+    mentions_long = backend.build_mentions_long(
+        df_mentions_src,
+        brand_col=brand_col,
+        inferred_brand_col=inferred_brand_col,
+        keep_cols=[c for c in df_mentions_src.columns if c != brand_col],
+    )
+
+    mentions_long = _maybe_date_filter(mentions_long, "run_date", key_prefix="mentions")
+    # Auto-merge exact-case brand variants (no user approval needed)
+    if hasattr(backend, "auto_merge_exact_case"):
+        mentions_long["brand"] = backend.auto_merge_exact_case(mentions_long["brand"])
+
+    # Re-apply any selected manual merges to the freshly built dataset
+    existing_merge_map = st.session_state.get("brand_merge_mapping", {})
+    if existing_merge_map and hasattr(backend, "apply_merge_mapping"):
+        mentions_long["brand"] = backend.apply_merge_mapping(mentions_long["brand"], existing_merge_map)
+
+    st.session_state["mentions_long"] = mentions_long
+
+
+    # ================================
+    # Brand merge workflow
+    # ================================
+    backend_mod = importlib.reload(backend)
+
+    if "active_rule_merges" not in st.session_state:
+        st.session_state["active_rule_merges"] = []
+    if "brand_merge_mapping" not in st.session_state:
+        st.session_state["brand_merge_mapping"] = {}
+    if "brand_merge_suggestions" not in st.session_state:
+        st.session_state["brand_merge_suggestions"] = None
+
+    raw_mentions_before_merges = mentions_long.copy()
+    mentions_for_analysis = mentions_long.copy()
+
+    active_rule_merges = st.session_state.get("active_rule_merges", [])
+    if active_rule_merges and hasattr(backend_mod, "apply_forced_rule_merges"):
+        mentions_for_analysis["brand"] = backend_mod.apply_forced_rule_merges(
+            mentions_for_analysis["brand"],
+            active_rule_merges,
+        )
+
+    active_exact_merges = st.session_state.get("brand_merge_mapping", {})
+    if active_exact_merges and hasattr(backend_mod, "apply_exact_merge_mapping"):
+        mentions_for_analysis["brand"] = backend_mod.apply_exact_merge_mapping(
+            mentions_for_analysis["brand"],
+            active_exact_merges,
+        )
+    elif active_exact_merges and hasattr(backend_mod, "apply_merge_mapping"):
+        mentions_for_analysis["brand"] = backend_mod.apply_merge_mapping(
+            mentions_for_analysis["brand"],
+            active_exact_merges,
+        )
+
+    mentions_long = mentions_for_analysis
+    st.session_state["mentions_long"] = mentions_long
+
+    with merge_box.expander("Rule-based brand merges", expanded=False):
+        if hasattr(backend_mod, "get_forced_brand_rule_hits"):
+            # Rule-based matches must be detected from the raw brand data,
+            # before any active merges are applied.
+            rule_counts = raw_mentions_before_merges["brand"].value_counts()
+            rule_hits = backend_mod.get_forced_brand_rule_hits(rule_counts.index.tolist(), rule_counts)
+        else:
+            rule_hits = pd.DataFrame()
+
+        if rule_hits is None or getattr(rule_hits, "empty", True):
+            st.caption("No unapplied rule-based merge matches found for the current data.")
+        else:
+            active_rule_ids = {str(r.get("rule_id", "")) for r in st.session_state.get("active_rule_merges", [])}
+            rule_hits = rule_hits.copy()
+
+            # Important: rule-based merges should never be pre-selected.
+            # The user must actively choose which rules to apply.
+            rule_hits = rule_hits[~rule_hits["rule_id"].astype(str).isin(active_rule_ids)].copy()
+            rule_hits["apply"] = False
+
+            st.write("These rules can group known product names under their parent brand. Select only the rules you want to apply.")
+            rule_display = st.data_editor(
+                rule_hits[["apply", "match", "canonical"]],
+                use_container_width=True,
+                hide_index=True,
+                key="rule_based_merge_editor",
+                column_config={
+                    "apply": st.column_config.CheckboxColumn("Apply"),
+                    "match": st.column_config.TextColumn("Brand / pattern", disabled=True),
+                    "canonical": st.column_config.TextColumn("Parent brand", disabled=True),
+                },
+            )
+
+            if st.button("Apply selected rule-based merges", type="primary", key="apply_rule_based_merges_btn"):
+                selected_idx = rule_display.index[rule_display["apply"] == True].tolist()
+                selected_rules = rule_hits.loc[selected_idx, ["type", "rule_id", "match", "canonical"]].to_dict("records")
+                existing_rules = st.session_state.get("active_rule_merges", [])
+                existing_ids = {str(r.get("rule_id", "")) for r in existing_rules}
+                for r in selected_rules:
+                    if str(r.get("rule_id", "")) not in existing_ids:
+                        existing_rules.append(r)
+                st.session_state["active_rule_merges"] = existing_rules
+                st.rerun()
+
+    try:
+        if not hasattr(backend_mod, "suggest_brand_merges"):
+            raise AttributeError("suggest_brand_merges is missing from backend.py")
+        brand_counts = mentions_long["brand"].value_counts()
+
+        # Anything covered by rule-based merge logic must stay out of fuzzy suggestions.
+        # Example: Landorid should appear under Rule-based merges, not Suggested brand merges.
+        if hasattr(backend_mod, "is_forced_brand_rule_match"):
+            allowed_brands_for_suggestions = [
+                b for b in brand_counts.index.tolist()
+                if not backend_mod.is_forced_brand_rule_match(b)
+            ]
+            brand_counts_for_suggestions = brand_counts.loc[allowed_brands_for_suggestions]
+        else:
+            allowed_brands_for_suggestions = brand_counts.index.tolist()
+            brand_counts_for_suggestions = brand_counts
+
+        sugg = backend_mod.suggest_brand_merges(
+            brands=allowed_brands_for_suggestions,
+            counts=brand_counts_for_suggestions,
+            min_containment_len=3,
+            similarity_threshold=0.80,
+            max_suggestions=500,
+        )
+
+        if sugg is not None and (hasattr(sugg, "empty") and (not sugg.empty)):
+            sugg = sugg.copy()
+
+            # Hard safety filter:
+            # Even if a rule-based brand slips into fuzzy suggestions,
+            # remove it here based on both alias and canonical.
+            if hasattr(backend_mod, "is_forced_brand_rule_match"):
+                forced_suggestion_mask = sugg.apply(
+                    lambda r: (
+                        backend_mod.is_forced_brand_rule_match(str(r.get("alias", "")))
+                        or backend_mod.is_forced_brand_rule_match(str(r.get("canonical", "")))
+                    ),
+                    axis=1,
+                )
+                sugg = sugg.loc[~forced_suggestion_mask].copy()
+
+            previous_sugg = st.session_state.get("brand_merge_suggestions")
+
+            def _norm_merge_value(x):
+                s = str(x).strip()
+                if hasattr(backend_mod, "normalize_brand"):
+                    s = backend_mod.normalize_brand(s)
+                return s.lower()
+
+            active_exact_merges = st.session_state.get("brand_merge_mapping", {})
+            if active_exact_merges:
+                normalized_merge_map = {
+                    _norm_merge_value(k): _norm_merge_value(v)
+                    for k, v in active_exact_merges.items()
+                    if str(k).strip() and str(v).strip()
+                }
+                already_applied_mask = sugg.apply(
+                    lambda r: normalized_merge_map.get(_norm_merge_value(r.get("alias", ""))) == _norm_merge_value(r.get("canonical", "")),
+                    axis=1,
+                )
+                sugg = sugg.loc[~already_applied_mask].copy()
+
+            previous_selected = set()
+            if previous_sugg is not None and hasattr(previous_sugg, "empty") and not previous_sugg.empty and "combine" in previous_sugg.columns:
+                prev_checked = previous_sugg[previous_sugg["combine"] == True].copy()
+                previous_selected = {
+                    (_norm_merge_value(r.get("alias", "")), _norm_merge_value(r.get("canonical", "")))
+                    for _, r in prev_checked.iterrows()
+                }
+
+            if not sugg.empty:
+                sugg.insert(
+                    0,
+                    "combine",
+                    sugg.apply(
+                        lambda r: (
+                            _norm_merge_value(r.get("alias", "")),
+                            _norm_merge_value(r.get("canonical", ""))
+                        ) in previous_selected,
+                        axis=1,
+                    ),
+                )
+
+        st.session_state["brand_merge_suggestions"] = sugg
+    except Exception as e:
+        st.session_state["brand_merge_suggestions"] = None
+        with merge_box.expander("Suggested brand merges", expanded=False):
+            st.error("Brand merge suggestions could not be generated.")
+            st.caption(f"Reason: {type(e).__name__}: {e}")
+            st.caption(f"Backend file loaded: {getattr(backend_mod, '__file__', 'unknown')}")
+
+    with merge_box.expander("Suggested brand merges", expanded=False):
+        sugg_df = st.session_state.get("brand_merge_suggestions")
+        if sugg_df is None:
+            st.caption("No suggestions generated yet.")
+        elif getattr(sugg_df, "empty", True):
+            st.caption("No fuzzy merge suggestions found for the current selection.")
+        else:
+            st.write("Select pairs to combine, then click Apply selected suggested merges.")
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                if st.button("Select all", key="select_all_merges_btn"):
+                    tmp = sugg_df.copy()
+                    tmp["combine"] = True
+                    st.session_state["brand_merge_suggestions"] = tmp
+                    st.rerun()
+            with col_s2:
+                if st.button("Clear selection", key="clear_all_merges_btn"):
+                    tmp = sugg_df.copy()
+                    tmp["combine"] = False
+                    st.session_state["brand_merge_suggestions"] = tmp
+                    st.rerun()
+
+            display_df = sugg_df[["combine", "alias", "canonical"]].copy()
+            edited = st.data_editor(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                key="brand_merge_editor",
+            )
+
+            if st.button("Apply selected suggested merges", type="primary", key="apply_brand_merges_btn"):
+                merge_map = _brand_merge_mapping_from_editor(edited)
+                existing_merge_map = st.session_state.get("brand_merge_mapping", {}).copy()
+                existing_merge_map.update(merge_map)
+                st.session_state["brand_merge_mapping"] = existing_merge_map
+                st.rerun()
+
+    with merge_box.expander("Add manual brand merge", expanded=False):
+        with st.form("manual_brand_merge_form", clear_on_submit=True):
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                manual_alias = st.text_input("Brand name to merge from")
+            with col_m2:
+                manual_canonical = st.text_input("Brand name to merge into")
+            add_manual_merge = st.form_submit_button("Add manual merge")
+
+        if add_manual_merge:
+            alias = str(manual_alias).strip()
+            canonical = str(manual_canonical).strip()
+            if not alias or not canonical:
+                st.warning("Please enter both brand names before adding a manual merge.")
+            elif alias == canonical:
+                st.warning("The two brand names must be different.")
+            else:
+                existing_merge_map = st.session_state.get("brand_merge_mapping", {}).copy()
+                existing_merge_map[alias] = canonical
+                st.session_state["brand_merge_mapping"] = existing_merge_map
+                st.success(f"Added manual merge: {alias} → {canonical}")
+                st.rerun()
+
+    with merge_box.expander("Active merges", expanded=False):
+        active_rows = []
+        for r in st.session_state.get("active_rule_merges", []):
+            active_rows.append({
+                "remove": False,
+                "type": "Rule",
+                "id": str(r.get("rule_id", "")),
+                "match": str(r.get("match", "")),
+                "canonical": str(r.get("canonical", "")),
+            })
+        for alias, canonical in st.session_state.get("brand_merge_mapping", {}).items():
+            active_rows.append({
+                "remove": False,
+                "type": "Exact",
+                "id": str(alias),
+                "match": str(alias),
+                "canonical": str(canonical),
+            })
+
+        if not active_rows:
+            st.caption("No active merges applied.")
+        else:
+            active_df = pd.DataFrame(active_rows)
+            active_edited = st.data_editor(
+                active_df,
+                use_container_width=True,
+                hide_index=True,
+                key="active_brand_merges_editor",
+                column_config={
+                    "remove": st.column_config.CheckboxColumn("Remove"),
+                    "type": st.column_config.TextColumn("Type", disabled=True),
+                    "match": st.column_config.TextColumn("Match", disabled=True),
+                    "canonical": st.column_config.TextColumn("Merge into", disabled=True),
+                },
+            )
+
+            col_r1, col_r2 = st.columns(2)
+            with col_r1:
+                if st.button("Remove selected active merges", key="remove_selected_active_merges_btn"):
+                    remove_rules = set(
+                        active_edited.loc[
+                            (active_edited["remove"] == True) & (active_edited["type"] == "Rule"),
+                            "id",
+                        ].astype(str).tolist()
+                    )
+                    remove_exact = set(
+                        active_edited.loc[
+                            (active_edited["remove"] == True) & (active_edited["type"] == "Exact"),
+                            "id",
+                        ].astype(str).tolist()
+                    )
+
+                    st.session_state["active_rule_merges"] = [
+                        r for r in st.session_state.get("active_rule_merges", [])
+                        if str(r.get("rule_id", "")) not in remove_rules
+                    ]
+                    st.session_state["brand_merge_mapping"] = {
+                        k: v for k, v in st.session_state.get("brand_merge_mapping", {}).items()
+                        if str(k) not in remove_exact
+                    }
+                    st.rerun()
+            with col_r2:
+                if st.button("Reset all active merges", key="reset_all_active_merges_btn"):
+                    st.session_state["active_rule_merges"] = []
+                    st.session_state["brand_merge_mapping"] = {}
+                    st.rerun()
+
+    # Build citations long if present
+    citations_long = None
+    if df_citations_src is not None:
+        dom_col_opts = [c for c in df_citations_src.columns if c.lower() in {"domain", "url"}] + [
+            c for c in df_citations_src.columns if "domain" in c.lower()
+        ]
+        with st.sidebar:
+            domain_col = st.selectbox(
+                "Citations domain column",
+                options=dom_col_opts or list(df_citations_src.columns),
+                index=0,
+                key="cit_domain_col",
+            )
+
+        citations_long = backend.build_citations_long(df_citations_src, domain_col=domain_col)
+        citations_long = _maybe_date_filter(citations_long, "run_date", key_prefix="citations")
+        st.session_state["citations_long"] = citations_long
+
+    # Tabs
+    tab_overview, tab_mentions, tab_sentiment, tab_citations, tab_export = st.tabs(
+        ["Overview", "Mentions", "Sentiment", "Citations", "Export"]
+    )
+
+    with tab_overview:
+        st.subheader("Quick stats")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Rows in mentions source", len(df_mentions_src))
+        c2.metric("Mentions (exploded)", len(mentions_long))
+        c3.metric("Unique brands", mentions_long["brand"].nunique())
+        if citations_long is not None:
+            c4.metric("Citations", len(citations_long))
+        else:
+            c4.metric("Citations", 0)
+
+        st.markdown("### Data preview")
+        st.write("Mentions (long format)")
+        st.dataframe(mentions_long.head(200), use_container_width=True)
+        if citations_long is not None:
+            st.write("Citations (long format)")
+            st.dataframe(citations_long.head(200), use_container_width=True)
+
+    with tab_mentions:
+        st.header("Brand mentions")
+        if not group_cols:
+            st.info("Pick at least one 'Group by' field in the sidebar to build grouped charts.")
+        counts, share = backend.aggregate_counts(
+            mentions_long,
+            item_col="brand",
+            group_cols=group_cols or ["platform"] if "platform" in mentions_long.columns else [],
+            top_n=top_n,
+            include_other=include_other,
+        )
+        _plot_clustered_bars(counts, value_name="count", title="Mentions count (clustered)")
+        _plot_clustered_bars(share, value_name="share", title="Mentions share (clustered)", as_percent=True)
+
+        # Trend chart if run_date selected
+        if "run_date" in group_cols and px is not None:
+            st.markdown("### Trend over time")
+            tmp = mentions_long.copy()
+            tmp["run_date"] = pd.to_datetime(tmp["run_date"], errors="coerce").dt.date
+            g = [c for c in group_cols if c != "run_date"]
+            tmp2 = tmp.groupby(["run_date"] + g + ["brand"]).size().reset_index(name="count")
+            fig = px.line(tmp2, x="run_date", y="count", color="brand", line_group="brand", title="Brand mentions over time")
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tab_sentiment:
+        st.header("Sentiment")
+        # Try to find sentiment from source sheet if not in mentions_long
+        sentiment_df = df_mentions_src.copy()
+        if "sentiment" not in sentiment_df.columns:
+            # attempt to locate sentiment from other likely sheet
+            if info.export_type == "basic" and "answers" in raw_sheets and "sentiment" in raw_sheets["answers"].columns:
+                sentiment_df = raw_sheets["answers"]
+            elif info.export_type == "advanced" and "Results" in raw_sheets and "sentiment" in raw_sheets["Results"].columns:
+                sentiment_df = raw_sheets["Results"]
+
+        if "sentiment" not in sentiment_df.columns:
+            st.info("No sentiment column found in the loaded sheets.")
+        else:
+            cols = [c for c in ["platform", "model", "country", "run_date"] if c in sentiment_df.columns]
+            group_s = st.multiselect("Group sentiment by", options=cols, default=[c for c in ["platform"] if c in cols], key="sentiment_group")
+            sentiment_df2 = sentiment_df.copy()
+            if "run_date" in sentiment_df2.columns:
+                sentiment_df2["run_date"] = pd.to_datetime(sentiment_df2["run_date"], errors="coerce")
+            sentiment_df2 = _maybe_date_filter(sentiment_df2, "run_date", key_prefix="sentiment")
+
+            summary = backend.sentiment_summary(sentiment_df2, group_s or (["platform"] if "platform" in sentiment_df2.columns else []))
+            st.dataframe(summary, use_container_width=True)
+
+            if px is not None:
+                sentiment_df2["sentiment"] = pd.to_numeric(sentiment_df2["sentiment"], errors="coerce")
+                if group_s:
+                    gcol = group_s[0]
+                    fig = px.box(sentiment_df2.dropna(subset=["sentiment"]), x=gcol, y="sentiment", title=f"Sentiment distribution by {gcol}")
+                    st.plotly_chart(fig, use_container_width=True)
+                fig2 = px.histogram(sentiment_df2.dropna(subset=["sentiment"]), x="sentiment", nbins=20, title="Sentiment histogram")
+                st.plotly_chart(fig2, use_container_width=True)
+
+    with tab_citations:
+        st.header("Citations")
+        if citations_long is None:
+            st.info("No citations sheet loaded (Advanced exports have a 'Citations' sheet).")
+        else:
+            group_cands = [
+                c
+                for c in ["platform", "model", "country", "parent_domain", "domain_classification"]
+                if c in citations_long.columns
+            ]
+            group_cols_c = st.multiselect(
+                "Group citations by",
+                options=group_cands,
+                default=[c for c in ["platform"] if c in group_cands],
+                key="cit_group",
+            )
+            top_n_c = st.slider("Top N domains", 5, 50, 20, 1, key="topn_dom")
+
+            counts_c, share_c = backend.aggregate_counts(
+                citations_long,
+                item_col="domain",
+                group_cols=group_cols_c or (["platform"] if "platform" in citations_long.columns else []),
+                top_n=top_n_c,
+                include_other=True,
+            )
+
+            _plot_clustered_bars(counts_c, value_name="count", title="Citations count (clustered)")
+            _plot_clustered_bars(share_c, value_name="share", title="Citations share (clustered)", as_percent=True)
+
+            st.markdown("### Top domains overall")
+            top_domains = citations_long["domain"].value_counts().head(top_n_c).reset_index()
+            top_domains.columns = ["domain", "count"]
+            st.dataframe(top_domains, use_container_width=True)
+
+            # All URLs overall (normalized for counting, UTM removed)
+            url_series = None
+            url_cols = [c for c in citations_long.columns if "url" in c.lower()] if citations_long is not None else []
+            if url_cols:
+                url_series = citations_long[url_cols[0]]
+            elif df_citations_src is not None:
+                src_url_cols = [c for c in df_citations_src.columns if "url" in c.lower()]
+                if src_url_cols:
+                    url_series = df_citations_src[src_url_cols[0]]
+
+            if url_series is not None:
+                urls_norm = url_series.dropna().astype(str).map(backend.normalize_url_for_count)
+                urls_norm = urls_norm[urls_norm.str.strip() != ""]
+                urls_norm = urls_norm[urls_norm.str.lower() != "nan"]
+                url_counts_all = urls_norm.value_counts().rename_axis("url").reset_index(name="count")
+                st.session_state["url_counts_all"] = url_counts_all
+
+                st.markdown("### All URLs overall")
+                q = st.text_input(
+                    "Search URLs",
+                    value="",
+                    placeholder="Type to filter, for example bygghemma",
+                    key="url_search_all",
+                )
+                min_count = st.number_input(
+                    "Minimum count",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key="url_min_count_all",
+                )
+
+                shown = url_counts_all[url_counts_all["count"] >= int(min_count)]
+                if q.strip():
+                    shown = shown[shown["url"].str.contains(q.strip(), case=False, na=False)]
+
+                st.dataframe(shown, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download URL counts (CSV)",
+                    data=url_counts_all.to_csv(index=False).encode("utf-8"),
+                    file_name="citation_url_counts_all.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            else:
+                st.info("No URL column found in citations data.")
+
+            if px is not None and "domain_classification" in citations_long.columns:
+                cls = (
+                    citations_long["domain_classification"]
+                    .replace("", "Unknown")
+                    .fillna("Unknown")
+                    .value_counts()
+                    .head(15)
+                    .reset_index()
+                )
+                cls.columns = ["classification", "count"]
+                fig = px.bar(cls, x="classification", y="count", title="Top domain classifications")
+                st.plotly_chart(fig, use_container_width=True)
+
+
+    with tab_export:
+        st.header("Export enhanced Excel")
+        st.write("The export includes your original sheets plus cleaned long tables and summary tables.")
+
+        # Build summaries for export based on current selections
+        # Export should always include all brands / domains, not only the current top-N display.
+        exp_group_cols = group_cols or (["platform"] if "platform" in mentions_long.columns else [])
+        export_top_n_mentions = max(int(mentions_long["brand"].nunique()), 1)
+        mention_counts, mention_share = backend.aggregate_counts(
+            mentions_long,
+            item_col="brand",
+            group_cols=exp_group_cols,
+            top_n=export_top_n_mentions,
+            include_other=False,
+        )
+
+        citation_counts = citation_share = None
+        if citations_long is not None:
+            exp_group_cols_c = ["platform"] if "platform" in citations_long.columns else []
+            export_top_n_citations = max(int(citations_long["domain"].nunique()), 1)
+            citation_counts, citation_share = backend.aggregate_counts(
+                citations_long,
+                item_col="domain",
+                group_cols=exp_group_cols_c,
+                top_n=export_top_n_citations,
+                include_other=False,
+            )
+
+        url_counts_all_for_export = st.session_state.get("url_counts_all")
+        if citations_long is not None and url_counts_all_for_export is None:
+            url_series_tmp = None
+            url_cols_tmp = [c for c in citations_long.columns if "url" in c.lower()]
+            if url_cols_tmp:
+                url_series_tmp = citations_long[url_cols_tmp[0]]
+            elif df_citations_src is not None:
+                src_url_cols_tmp = [c for c in df_citations_src.columns if "url" in c.lower()]
+                if src_url_cols_tmp:
+                    url_series_tmp = df_citations_src[src_url_cols_tmp[0]]
+            if url_series_tmp is not None:
+                urls_tmp = url_series_tmp.dropna().astype(str).map(backend.normalize_url_for_count)
+                urls_tmp = urls_tmp[urls_tmp.str.strip() != ""]
+                urls_tmp = urls_tmp[urls_tmp.str.lower() != "nan"]
+                url_counts_all_for_export = urls_tmp.value_counts().rename_axis("url").reset_index(name="count")
+
+        xlsx_bytes = backend.build_enhanced_excel(
+            raw_sheets=raw_sheets,
+            mentions_long=mentions_long,
+            citations_long=citations_long,
+            mention_counts=mention_counts,
+            mention_share=mention_share,
+            citation_counts=citation_counts,
+            citation_share=citation_share,
+            url_counts_all=url_counts_all_for_export,
+        )
+        input_stem = Path(uploaded.name).stem
+        safe_input_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in input_stem).strip("_")
+        if not safe_input_stem:
+            safe_input_stem = "input_file"
+        export_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_filename = f"{safe_input_stem}_enhanced_{export_timestamp}.xlsx"
+
+        st.download_button(
+            "Download enhanced Excel",
+            data=xlsx_bytes,
+            file_name=export_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        st.markdown("### What gets exported")
+        st.write(
+            [
+                "Original loaded sheets (as-is)",
+                "Mentions_Long: exploded and normalized mentions, one row per brand mention",
+                "Citations_Long: cleaned citations with normalized domains (Advanced exports)",
+                "Mentions_Counts and Mentions_Share: summary pivot tables",
+                "Citations_Counts and Citations_Share: summary pivot tables (Advanced exports)",
+            ]
+        )
+
+
+if __name__ == "__main__":
+    main()
